@@ -380,7 +380,7 @@ bool TorboxClient::createFromMagnet(const std::string& magnet,
     if (parseCreate(response.body, torboxId, error, &duplicate))
         return true;
     if (!duplicate)
-        return false;
+        return finishParse(false, response.status, error);
 
     std::string hash;
     if (!decodeBtih(magnet, hash)) {
@@ -482,6 +482,7 @@ bool TorboxClient::remove(uint64_t torboxId, std::string& error) {
     request.apiKey = apiKey_;
     request.body = std::string("{\"torrent_id\":") +
         std::to_string(torboxId) + ",\"operation\":\"delete\"}";
+    request.apiKey = apiKey_;
     TorboxHttpResponse response;
     if (!transport_(request, response, error))
         return false;
