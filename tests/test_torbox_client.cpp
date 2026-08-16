@@ -16,6 +16,9 @@ const char* kCreateOk = R"({"success":true,"error":null,
 const char* kCreateAuthFail = R"({"success":false,"error":"BAD_TOKEN",
   "detail":"Invalid token."})";
 
+const char* kCreateDuplicate = R"({"success":false,"error":"DUPLICATE_ITEM",
+  "detail":"This item already exists."})";
+
 const char* kInfoFetching = R"({"success":true,"data":{
   "id":297464,"hash":"aa11bb22cc33dd44ee55ff667788990011223344",
   "name":"Example Game","size":1000000,"progress":0.42,
@@ -45,11 +48,17 @@ const char* kLinkOk =
 void testParseCreate() {
     uint64_t id = 0;
     std::string error;
-    assert(TorboxClient::parseCreate(kCreateOk, id, error));
+    bool duplicate = false;
+    assert(TorboxClient::parseCreate(kCreateOk, id, error, &duplicate));
     assert(id == 297464);
-    assert(!TorboxClient::parseCreate(kCreateAuthFail, id, error));
+    assert(!duplicate);
+    assert(!TorboxClient::parseCreate(kCreateAuthFail, id, error, &duplicate));
+    assert(!duplicate);
     assert(error.rfind("TorBox key rejected", 0) == 0);
-    assert(!TorboxClient::parseCreate("{not json", id, error));
+    assert(!TorboxClient::parseCreate(kCreateDuplicate, id, error, &duplicate));
+    assert(duplicate);
+    assert(error == "This item already exists.");
+    assert(!TorboxClient::parseCreate("{not json", id, error, &duplicate));
     assert(!error.empty());
 }
 
@@ -67,11 +76,24 @@ void testParseInfo() {
     assert(info.files.size() == 2);
     assert(info.files[0].name == "Example Game/game.nsp");
     assert(info.files[0].size == 900000);
-    assert(info.files[1].id == 1);
+    assert(info.files[1].id == 1;
 
     assert(TorboxClient::parseInfo(kInfoArray, 297464, info, error));
     assert(info.id == 297464);
     assert(!TorboxClient::parseInfo(kInfoArray, 999, info, error));
+    assert(error == "TorBox torrent not found.");
+}
+
+void testParseInfoByHash() {
+    TorboxTorrentInfo info;
+    std::string error;
+    const std::string hash = "AA11BB22CC33DD44EE55FF667788990011223344";
+    assert(TorboxClient::parseInfoByHash(kInfoArray, hash, info, error));
+    assert(info.id == 297464);
+    assert(info.name == "Example Game");
+    assert(!TorboxClient::parseInfoByHash(kInfoArray,
+                                          "00112233445566778899aabbccddeeff00112233",
+                                          info, error));
     assert(error == "TorBox torrent not found.");
 }
 
@@ -85,11 +107,6 @@ void testParseDownloadLink() {
 }
 
 void testRequestDownloadLinkSendsToken() {
-    // Regression: TorBox's /torrents/requestdl authenticates via a `token`
-    // query parameter, NOT the Authorization header. Omitting it yields an
-    // HTTP 422 validation error ({"detail":[{"loc":["query","token"],...}]}),
-    // which the client surfaces as the generic "TorBox request failed
-    // (HTTP 422)". The request URL must carry token/torrent_id/file_id.
     pipensx::TorboxHttpRequest seen;
     pipensx::TorboxClient client("test-key",
         [&seen](const pipensx::TorboxHttpRequest& request,
@@ -107,6 +124,36 @@ void testRequestDownloadLinkSendsToken() {
     assert(seen.url.find("token=test-key") != std::string::npos);
     assert(seen.url.find("torrent_id=297464") != std::string::npos);
     assert(seen.url.find("file_id=3") != std::string::npos);
+}
+
+void testDuplicateMagnetIsReused() {
+    pipensx::TorboxHttpRequest createRequest;
+    int calls = 0;
+    pipensx::TorboxClient client("test-key",
+        [&createRequest, &calls](const pipensx::TorboxHttpRequest& request,
+                                 pipensx::TorboxHttpResponse& response,
+                                 std::string&) {
+            ++calls;
+            createRequest = request;
+            if (calls == 1) {
+                response.status = 200;
+                response.body = kCreateDuplicate;
+                return true;
+            }
+            response.status = 200;
+            response.body = kInfoArray;
+            return true;
+        });
+
+    uint64_t id = 0;
+    std::string error;
+    const std::string magnet =
+        "magnet:?xt=urn:btih:AA11BB22CC33DD44EE55FF667788990011223344";
+    assert(client.createFromMagnet(magnet, id, error));
+    assert(id == 297464);
+    assert(error.empty());
+    assert(calls == 2);
+    assert(createRequest.magnet == magnet);
 }
 
 void testTransportInjection() {
@@ -128,7 +175,6 @@ void testTransportInjection() {
     assert(seen.magnet == "magnet:?xt=urn:btih:aa11");
     assert(seen.apiKey == "test-key");
 
-    // Test HTTP 401 auth failure
     pipensx::TorboxClient authFailClient("bad-key",
         [](const pipensx::TorboxHttpRequest&,
            pipensx::TorboxHttpResponse& response, std::string&) {
@@ -140,7 +186,6 @@ void testTransportInjection() {
                                             error));
     assert(error == "TorBox key rejected - relink in Settings.");
 
-    // Test HTTP 500 with generic failure message gets status appended
     pipensx::TorboxClient serverErrClient("test-key",
         [](const pipensx::TorboxHttpRequest&,
            pipensx::TorboxHttpResponse& response, std::string&) {
@@ -153,10 +198,7 @@ void testTransportInjection() {
     assert(error == "TorBox request failed (HTTP 500).");
 }
 
-// Verify that parsers handle wrong-typed / null JSON fields without throwing.
-// A null or mistyped field must yield a safe default (or false), never crash.
 void testMalformedFieldsNoThrow() {
-    // parseInfo: key fields present but typed as null / wrong type.
     {
         const char* malformed =
             "{\"success\":true,\"data\":{"
@@ -173,7 +215,6 @@ void testMalformedFieldsNoThrow() {
             threw = true;
         }
         assert(!threw);
-        // Result is either true-with-safe-defaults or false; never a crash.
         if (ok) {
             assert(info.id == 42);
             assert(info.hash.empty());
@@ -183,7 +224,6 @@ void testMalformedFieldsNoThrow() {
         }
     }
 
-    // checkSuccess / parseSuccess: "success" field present as a string.
     {
         std::string error;
         bool threw = false;
@@ -196,7 +236,6 @@ void testMalformedFieldsNoThrow() {
         assert(!threw);
     }
 
-    // parseCreate: "success" typed as non-bool should not throw.
     {
         uint64_t id = 0;
         std::string error;
@@ -211,7 +250,6 @@ void testMalformedFieldsNoThrow() {
         assert(!threw);
     }
 
-    // parseDownloadLink: "data" typed as integer instead of string.
     {
         std::string url;
         std::string error;
@@ -224,7 +262,7 @@ void testMalformedFieldsNoThrow() {
             threw = true;
         }
         assert(!threw);
-        assert(!ok); // wrong type → no link returned
+        assert(!ok);
         assert(!error.empty());
     }
 }
@@ -234,8 +272,10 @@ void testMalformedFieldsNoThrow() {
 int main() {
     testParseCreate();
     testParseInfo();
+    testParseInfoByHash();
     testParseDownloadLink();
     testRequestDownloadLinkSendsToken();
+    testDuplicateMagnetIsReused();
     testTransportInjection();
     testMalformedFieldsNoThrow();
     std::printf("test_torbox_client ok\n");
