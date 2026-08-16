@@ -212,10 +212,11 @@ void testMalformedFieldsNoThrow() {
     assert(!threw);
 
     threw = false;
+    uint64_t id = 0;
     try {
         TorboxClient::parseCreate(
             "{\"success\":\"true\",\"data\":{\"torrent_id\":\"bad\"}}",
-            *new uint64_t(0), error);
+            id, error);
     } catch (...) {
         threw = true;
     }
