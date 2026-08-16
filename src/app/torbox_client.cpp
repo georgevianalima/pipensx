@@ -5,6 +5,11 @@
 
 #include <curl/curl.h>
 
+#include <cctype>
+#include <cstring>
+#include <iomanip>
+#include <sstream>
+
 extern "C" {
 #include "../core/util.h"
 }
@@ -135,9 +140,6 @@ bool readInfoObject(const Json& item, TorboxTorrentInfo& info,
     info.progress = (item.contains("progress") &&
                      item["progress"].is_number())
                         ? item["progress"].get<double>() : 0.0;
-    /* The API reports the percentage 0..100; normalize to the 0..1 fraction
-       the task/UI expect. The >1 guard keeps 0..1 responses (if the server
-       ever switches) working unchanged. */
     if (info.progress > 1.0)
         info.progress /= 100.0;
     if (info.progress < 0.0)
@@ -151,9 +153,9 @@ bool readInfoObject(const Json& item, TorboxTorrentInfo& info,
         bool finished = item.contains("download_finished") &&
                         item["download_finished"].is_boolean() &&
                         item["download_finished"].get<bool>();
-        bool present  = item.contains("download_present") &&
-                        item["download_present"].is_boolean() &&
-                        item["download_present"].get<bool>();
+        bool present = item.contains("download_present") &&
+                       item["download_present"].is_boolean() &&
+                       item["download_present"].get<bool>();
         info.ready = finished && present;
     }
     if (item.contains("files") && item["files"].is_array()) {
@@ -170,6 +172,70 @@ bool readInfoObject(const Json& item, TorboxTorrentInfo& info,
             info.files.push_back(std::move(entry));
         }
     }
+    return true;
+}
+
+bool sameHash(const std::string& left, const std::string& right) {
+    if (left.size() != right.size())
+        return false;
+    for (size_t i = 0; i < left.size(); ++i) {
+        const char a = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(left[i])));
+        const char b = static_cast<char>(std::tolower(
+            static_cast<unsigned char>(right[i])));
+        if (a != b)
+            return false;
+    }
+    return true;
+}
+
+bool decodeBtih(const std::string& magnet, std::string& hash) {
+    const std::string marker = "urn:btih:";
+    const size_t start = magnet.find(marker);
+    if (start == std::string::npos)
+        return false;
+
+    std::string value = magnet.substr(start + marker.size());
+    const size_t end = value.find_first_of("&?#");
+    if (end != std::string::npos)
+        value.resize(end);
+    if (value.size() == 40) {
+        for (char& c : value) {
+            if (!std::isxdigit(static_cast<unsigned char>(c)))
+                return false;
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        hash = value;
+        return true;
+    }
+
+    // Magnet links can also contain the 20-byte BTIH as base32.
+    if (value.size() != 32)
+        return false;
+    const char* alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    std::vector<unsigned char> bytes;
+    bytes.reserve(20);
+    uint32_t buffer = 0;
+    int bits = 0;
+    for (char raw : value) {
+        char c = static_cast<char>(std::toupper(static_cast<unsigned char>(raw)));
+        const char* p = std::strchr(alphabet, c);
+        if (!p)
+            return false;
+        buffer = (buffer << 5) | static_cast<uint32_t>(p - alphabet);
+        bits += 5;
+        if (bits >= 8) {
+            bits -= 8;
+            bytes.push_back(static_cast<unsigned char>((buffer >> bits) & 0xff));
+        }
+    }
+    if (bytes.size() != 20)
+        return false;
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (unsigned char byte : bytes)
+        out << std::setw(2) << static_cast<unsigned int>(byte);
+    hash = out.str();
     return true;
 }
 
@@ -194,10 +260,17 @@ bool TorboxClient::parseSuccess(const std::string& json, std::string& error) {
 }
 
 bool TorboxClient::parseCreate(const std::string& json, uint64_t& torboxId,
-                               std::string& error) {
+                               std::string& error, bool* duplicate) {
+    if (duplicate)
+        *duplicate = false;
     Json root;
-    if (!rootObject(json, root, error) || !checkSuccess(root, error))
+    if (!rootObject(json, root, error))
         return false;
+    if (!checkSuccess(root, error)) {
+        if (duplicate && root.contains("error") && root["error"].is_string())
+            *duplicate = root["error"].get<std::string>() == "DUPLICATE_ITEM";
+        return false;
+    }
     if (!root.contains("data") || !root["data"].is_object() ||
         !root["data"].contains("torrent_id") ||
         !root["data"]["torrent_id"].is_number()) {
@@ -229,6 +302,30 @@ bool TorboxClient::parseInfo(const std::string& json, uint64_t torboxId,
                 info = std::move(candidate);
                 return true;
             }
+        }
+    }
+    error = "TorBox torrent not found.";
+    return false;
+}
+
+bool TorboxClient::parseInfoByHash(const std::string& json,
+                                   const std::string& hash,
+                                   TorboxTorrentInfo& info,
+                                   std::string& error) {
+    Json root;
+    if (!rootObject(json, root, error) || !checkSuccess(root, error))
+        return false;
+    if (!root.contains("data") || !root["data"].is_array()) {
+        error = "TorBox returned no torrent list.";
+        return false;
+    }
+    for (const Json& item : root["data"]) {
+        TorboxTorrentInfo candidate;
+        std::string itemError;
+        if (readInfoObject(item, candidate, itemError) &&
+            !candidate.hash.empty() && sameHash(candidate.hash, hash)) {
+            info = std::move(candidate);
+            return true;
         }
     }
     error = "TorBox torrent not found.";
@@ -278,8 +375,29 @@ bool TorboxClient::createFromMagnet(const std::string& magnet,
         error = "TorBox key rejected - relink in Settings.";
         return false;
     }
-    return finishParse(parseCreate(response.body, torboxId, error),
-                       response.status, error);
+
+    bool duplicate = false;
+    if (parseCreate(response.body, torboxId, error, &duplicate))
+        return true;
+    if (!duplicate)
+        return false;
+
+    std::string hash;
+    if (!decodeBtih(magnet, hash)) {
+        error = "TorBox already has this torrent, but its magnet hash could not be read.";
+        return false;
+    }
+
+    TorboxTorrentInfo existing;
+    std::string lookupError;
+    if (!fetchInfoByHash(hash, existing, lookupError)) {
+        error = "TorBox already has this torrent, but it could not be located by hash: " +
+                lookupError;
+        return false;
+    }
+    torboxId = existing.id;
+    error.clear();
+    return true;
 }
 
 bool TorboxClient::createFromFile(const std::string& torrentPath,
@@ -318,13 +436,30 @@ bool TorboxClient::fetchInfo(uint64_t torboxId, TorboxTorrentInfo& info,
                        response.status, error);
 }
 
+bool TorboxClient::fetchInfoByHash(const std::string& hash,
+                                   TorboxTorrentInfo& info,
+                                   std::string& error) {
+    TorboxHttpRequest request;
+    request.method = "GET";
+    // The current mylist endpoint does not expose a hash filter. We request
+    // the list and compare the returned torrent hashes locally.
+    request.url = std::string(kBaseUrl) + "/torrents/mylist?bypass_cache=true";
+    request.apiKey = apiKey_;
+    TorboxHttpResponse response;
+    if (!transport_(request, response, error))
+        return false;
+    if (response.status == 401 || response.status == 403) {
+        error = "TorBox key rejected - relink in Settings.";
+        return false;
+    }
+    return finishParse(parseInfoByHash(response.body, hash, info, error),
+                       response.status, error);
+}
+
 bool TorboxClient::requestDownloadLink(uint64_t torboxId, uint64_t fileId,
                                        std::string& url, std::string& error) {
     TorboxHttpRequest request;
     request.method = "GET";
-    // TorBox's requestdl endpoint authenticates via a `token` query parameter,
-    // not the Authorization header. Without it the API returns HTTP 422
-    // ({"detail":[{"loc":["query","token"],"msg":"Field required"}]}).
     request.url = std::string(kBaseUrl) + "/torrents/requestdl?token=" +
         apiKey_ + "&torrent_id=" + std::to_string(torboxId) +
         "&file_id=" + std::to_string(fileId);
