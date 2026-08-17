@@ -532,7 +532,7 @@ $(BUILD_DIR)/tests/test_peer: tests/test_peer.c src/core/peer.c src/core/net.c \
 		src/core/bencode.c src/core/util.c src/core/mse.c src/core/sha1.c \
 		$(UTP_OBJS)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS) -lstdc++ -Wl,--wrap=setsockopt
+	$(CC) $(CFLAGS) -Isrc -o $@ $^ $(LDFLAGS) -lstdc++ -Wl,--wrap=setsockopt -Wl,--wrap=send
 
 $(BUILD_DIR)/tests/test_tracker: tests/test_tracker.c src/core/tracker.c \
 		src/core/bencode.c src/core/util.c src/core/net.c

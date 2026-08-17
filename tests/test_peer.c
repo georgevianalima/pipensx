@@ -16,6 +16,32 @@
 static socket_t receive_buffer_failure_fd = INVALID_SOCK;
 static int receive_buffer_primary_attempts;
 static int receive_buffer_fallback_attempts;
+static int partial_send_fd = -1;
+static size_t partial_send_limit;
+static int partial_send_enabled;
+static int partial_send_stage;
+
+ssize_t __real_send(int fd, const void *buf, size_t len, int flags);
+
+ssize_t __wrap_send(int fd, const void *buf, size_t len, int flags) {
+    if (!partial_send_enabled || fd != partial_send_fd)
+        return __real_send(fd, buf, len, flags);
+
+    if (partial_send_stage == 0 &&
+        partial_send_limit > 0 &&
+        len > partial_send_limit) {
+        partial_send_stage = 1;
+        return __real_send(fd, buf, partial_send_limit, flags);
+    }
+
+    if (partial_send_stage == 1) {
+        partial_send_stage = 2;
+        errno = EAGAIN;
+        return -1;
+    }
+
+    return __real_send(fd, buf, len, flags);
+}
 
 int __real_setsockopt(int fd, int level, int option_name,
                       const void *option_value, socklen_t option_len);
@@ -152,9 +178,10 @@ static void test_partial_send_queues_tail_and_flush_completes_frame(void) {
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     assert(net_set_nonblock(sockets[0]));
-    int sndbuf = 1;
-    assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF, &sndbuf,
-                      sizeof(sndbuf)) == 0);
+    partial_send_fd = sockets[0];
+    partial_send_limit = 100;
+    partial_send_enabled = 1;
+    partial_send_stage = 0;
 
     peer_t peer;
     memset(&peer, 0, sizeof(peer));
@@ -187,6 +214,11 @@ static void test_partial_send_queues_tail_and_flush_completes_frame(void) {
            frame[3] == ((1 + BF_BYTES) & 0xFF));
     assert(frame[4] == MSG_BITFIELD);
     assert(memcmp(frame + 5, bitfield, BF_BYTES) == 0);
+
+    partial_send_enabled = 0;
+    partial_send_fd = -1;
+    partial_send_limit = 0;
+    partial_send_stage = 0;
 
     close(sockets[0]);
     close(sockets[1]);

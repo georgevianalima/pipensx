@@ -51,6 +51,8 @@ public:
                         std::string& error);
     bool fetchInfo(uint64_t torboxId, TorboxTorrentInfo& info,
                    std::string& error);
+    bool fetchInfoByHash(const std::string& hash, TorboxTorrentInfo& info,
+                         std::string& error);
     bool requestDownloadLink(uint64_t torboxId, uint64_t fileId,
                              std::string& url, std::string& error);
     bool remove(uint64_t torboxId, std::string& error);
@@ -59,9 +61,11 @@ public:
     // Pure parsers (unit-tested directly):
     static bool parseSuccess(const std::string& json, std::string& error);
     static bool parseCreate(const std::string& json, uint64_t& torboxId,
-                            std::string& error);
+                            std::string& error, bool* duplicate = nullptr);
     static bool parseInfo(const std::string& json, uint64_t torboxId,
                           TorboxTorrentInfo& info, std::string& error);
+    static bool parseInfoByHash(const std::string& json, const std::string& hash,
+                                TorboxTorrentInfo& info, std::string& error);
     static bool parseDownloadLink(const std::string& json, std::string& url,
                                   std::string& error);
 
