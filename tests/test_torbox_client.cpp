@@ -119,30 +119,65 @@ void testRequestDownloadLinkSendsToken() {
 
 void testDuplicateMagnetIsReused() {
     int calls = 0;
+
     pipensx::TorboxClient client("test-key",
         [&calls](const pipensx::TorboxHttpRequest& request,
                  pipensx::TorboxHttpResponse& response, std::string&) {
             ++calls;
+
             if (calls == 1) {
                 assert(request.magnet.find("urn:btih:") != std::string::npos);
                 response.status = 200;
                 response.body = kCreateDuplicate;
-            } else {
-                assert(request.url.find("/torrents/mylist") != std::string::npos);
-                assert(request.url.find("bypass_cache=true") != std::string::npos);
-                response.status = 200;
-                response.body = kInfoArray;
+                return true;
             }
+
+            assert(request.url.find("/torrents/mylist") != std::string::npos);
+            assert(request.url.find("bypass_cache=true") != std::string::npos);
+            assert(request.url.find("limit=1000") != std::string::npos);
+
+            if (calls == 2) {
+                assert(request.url.find("offset=0") != std::string::npos);
+
+                std::string body =
+                    R"({"success":true,"data":[)";
+                for (int i = 0; i < 1000; ++i) {
+                    if (i > 0)
+                        body += ",";
+                    body +=
+                        R"({"id":)" + std::to_string(10000 + i) +
+                        R"(,"hash":"00112233445566778899aabbccddeeff00112233",)";
+                    body +=
+                        R"("name":"other","size":1,"progress":1.0,)";
+                    body +=
+                        R"("download_state":"completed","download_finished":true,)";
+                    body +=
+                        R"("download_present":true,"files":[]})";
+                }
+                body += "]}";
+
+                response.status = 200;
+                response.body = std::move(body);
+                return true;
+            }
+
+            assert(calls == 3);
+            assert(request.url.find("offset=1000") != std::string::npos);
+
+            response.status = 200;
+            response.body = kInfoArray;
             return true;
         });
+
     uint64_t id = 0;
     std::string error;
     const std::string magnet =
         "magnet:?xt=urn:btih:AA11BB22CC33DD44EE55FF667788990011223344";
+
     assert(client.createFromMagnet(magnet, id, error));
     assert(id == 297464);
     assert(error.empty());
-    assert(calls == 2);
+    assert(calls == 3);
 }
 
 void testTransportInjection() {

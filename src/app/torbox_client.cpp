@@ -439,21 +439,69 @@ bool TorboxClient::fetchInfo(uint64_t torboxId, TorboxTorrentInfo& info,
 bool TorboxClient::fetchInfoByHash(const std::string& hash,
                                    TorboxTorrentInfo& info,
                                    std::string& error) {
-    TorboxHttpRequest request;
-    request.method = "GET";
-    // The current mylist endpoint does not expose a hash filter. We request
-    // the list and compare the returned torrent hashes locally.
-    request.url = std::string(kBaseUrl) + "/torrents/mylist?bypass_cache=true";
-    request.apiKey = apiKey_;
-    TorboxHttpResponse response;
-    if (!transport_(request, response, error))
-        return false;
-    if (response.status == 401 || response.status == 403) {
-        error = "TorBox key rejected - relink in Settings.";
-        return false;
+    constexpr uint64_t kPageSize = 1000;
+    constexpr uint64_t kMaxPages = 1000;
+
+    for (uint64_t page = 0; page < kMaxPages; ++page) {
+        const uint64_t offset = page * kPageSize;
+
+        TorboxHttpRequest request;
+        request.method = "GET";
+        request.url = std::string(kBaseUrl) +
+            "/torrents/mylist?bypass_cache=true&offset=" +
+            std::to_string(offset) +
+            "&limit=" + std::to_string(kPageSize);
+        request.apiKey = apiKey_;
+
+        TorboxHttpResponse response;
+        if (!transport_(request, response, error))
+            return false;
+
+        if (response.status == 401 || response.status == 403) {
+            error = "TorBox key rejected - relink in Settings.";
+            return false;
+        }
+
+        Json root;
+        std::string parseError;
+        if (!rootObject(response.body, root, parseError))
+            return finishParse(false, response.status, error = parseError);
+
+        if (!checkSuccess(root, error))
+            return finishParse(false, response.status, error);
+
+        if (!root.contains("data") || !root["data"].is_array()) {
+            error = "TorBox returned no torrent list.";
+            return finishParse(false, response.status, error);
+        }
+
+        const Json& data = root["data"];
+
+        if (data.empty()) {
+            error = "TorBox torrent not found.";
+            return finishParse(false, response.status, error);
+        }
+
+        for (const Json& item : data) {
+            TorboxTorrentInfo candidate;
+            std::string itemError;
+            if (readInfoObject(item, candidate, itemError) &&
+                !candidate.hash.empty() &&
+                sameHash(candidate.hash, hash)) {
+                info = std::move(candidate);
+                error.clear();
+                return true;
+            }
+        }
+
+        if (data.size() < kPageSize) {
+            error = "TorBox torrent not found.";
+            return finishParse(false, response.status, error);
+        }
     }
-    return finishParse(parseInfoByHash(response.body, hash, info, error),
-                       response.status, error);
+
+    error = "TorBox torrent lookup exceeded the maximum page limit.";
+    return false;
 }
 
 bool TorboxClient::requestDownloadLink(uint64_t torboxId, uint64_t fileId,
